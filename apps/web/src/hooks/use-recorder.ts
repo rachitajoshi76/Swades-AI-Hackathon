@@ -1,14 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from "react"
+import { opfsManager } from "@/lib/opfs"
+import { env } from "@my-better-t-app/env/web"
 
 const SAMPLE_RATE = 16000
 const BUFFER_SIZE = 4096
 
 export interface WavChunk {
   id: string
+  chunkId: string
   blob: Blob
   url: string
   duration: number
   timestamp: number
+  status: 'stored' | 'uploading' | 'uploaded' | 'acked' | 'failed'
+  transcriptionStatus?: 'pending' | 'processing' | 'completed' | 'failed'
+  transcript?: string
 }
 
 export type RecorderStatus = "idle" | "requesting" | "recording" | "paused"
@@ -86,7 +92,93 @@ export function useRecorder(options: UseRecorderOptions = {}) {
 
   statusRef.current = status
 
-  const flushChunk = useCallback(() => {
+  const uploadChunk = useCallback(async (chunk: WavChunk) => {
+    setChunks((prev) => prev.map(c => c.id === chunk.id ? { ...c, status: 'uploading' } : c))
+
+    try {
+      console.log('Uploading chunk:', chunk.chunkId)
+      console.log('Server URL:', env.NEXT_PUBLIC_SERVER_URL)
+
+      const data = await chunk.blob.arrayBuffer()
+      const bytes = new Uint8Array(data)
+      
+      // Convert to base64 without spreading (prevents stack overflow)
+      let binaryString = ''
+      const chunkSize = 8192
+      for (let i = 0; i < bytes.length; i += chunkSize) {
+        binaryString += String.fromCharCode.apply(null, Array.from(bytes.slice(i, i + chunkSize)))
+      }
+      const base64 = btoa(binaryString)
+
+      const url = `${env.NEXT_PUBLIC_SERVER_URL}/api/chunks/upload`
+      console.log('Fetch URL:', url)
+
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chunkId: chunk.chunkId, data: base64 }),
+      })
+
+      console.log('Response status:', response.status)
+
+      if (response.ok) {
+        const result = await response.json()
+        console.log('Upload success:', result)
+        setChunks((prev) => prev.map(c => c.id === chunk.id ? { ...c, status: 'acked' } : c))
+        // Clear from OPFS after successful ack
+        await opfsManager.deleteChunk(chunk.chunkId)
+        // Start polling for transcription
+        pollTranscription(chunk.chunkId)
+      } else {
+        const errorText = await response.text()
+        throw new Error(`Upload failed with status ${response.status}: ${errorText}`)
+      }
+    } catch (error) {
+      console.error('Upload failed:', error, error instanceof Error ? error.stack : '')
+      setChunks((prev) => prev.map(c => c.id === chunk.id ? { ...c, status: 'failed' } : c))
+    }
+  }, [])
+
+  const pollTranscription = useCallback((chunkId: string) => {
+    const maxAttempts = 120 // 2 minutes with 1s intervals
+    let attempts = 0
+
+    const poll = async () => {
+      try {
+        const response = await fetch(`${env.NEXT_PUBLIC_SERVER_URL}/api/chunks/${chunkId}`)
+        if (!response.ok) {
+          console.warn(`Failed to fetch chunk ${chunkId}:`, response.status)
+          return
+        }
+
+        const data = await response.json()
+        console.log(`Chunk ${chunkId} poll result:`, data.transcriptionStatus, data.transcript)
+        
+        setChunks((prev) => prev.map(c => c.chunkId === chunkId ? {
+          ...c,
+          transcriptionStatus: data.transcriptionStatus,
+          transcript: data.transcript,
+        } : c))
+
+        if (data.transcriptionStatus !== 'processing' && data.transcriptionStatus !== 'pending') {
+          console.log(`Transcription complete for ${chunkId}`)
+          return
+        }
+
+        attempts++
+        if (attempts < maxAttempts) {
+          setTimeout(poll, 1000)
+        }
+      } catch (error) {
+        console.error(`Failed to poll transcription for ${chunkId}:`, error)
+      }
+    }
+
+    console.log(`Starting transcription poll for ${chunkId}`)
+    poll()
+  }, [])
+
+  const flushChunk = useCallback(async () => {
     if (samplesRef.current.length === 0) return
 
     const totalLen = samplesRef.current.reduce((n, b) => n + b.length, 0)
@@ -101,14 +193,31 @@ export function useRecorder(options: UseRecorderOptions = {}) {
 
     const blob = encodeWav(merged, SAMPLE_RATE)
     const url = URL.createObjectURL(blob)
+    const chunkId = crypto.randomUUID()
     const chunk: WavChunk = {
       id: crypto.randomUUID(),
+      chunkId,
       blob,
       url,
       duration: merged.length / SAMPLE_RATE,
       timestamp: Date.now(),
+      status: 'stored',
+      transcriptionStatus: 'pending',
+      transcript: undefined,
     }
+
+    // Store in OPFS
+    try {
+      await opfsManager.storeChunk(chunkId, await blob.arrayBuffer())
+    } catch (error) {
+      console.error('Failed to store chunk in OPFS:', error)
+      chunk.status = 'failed'
+    }
+
     setChunks((prev) => [...prev, chunk])
+
+    // Attempt to upload
+    uploadChunk(chunk)
   }, [])
 
   const start = useCallback(async () => {
@@ -150,12 +259,17 @@ export function useRecorder(options: UseRecorderOptions = {}) {
 
           const blob = encodeWav(merged, SAMPLE_RATE)
           const url = URL.createObjectURL(blob)
+          const chunkId = crypto.randomUUID()
           const chunk: WavChunk = {
             id: crypto.randomUUID(),
+            chunkId,
             blob,
             url,
             duration: merged.length / SAMPLE_RATE,
             timestamp: Date.now(),
+            status: 'stored',
+            transcriptionStatus: 'pending',
+            transcript: undefined,
           }
           setChunks((prev) => [...prev, chunk])
         }
@@ -217,22 +331,64 @@ export function useRecorder(options: UseRecorderOptions = {}) {
     setStatus("recording")
   }, [])
 
+  const retryFailedUploads = useCallback(async () => {
+    const failedChunks = chunks.filter(c => c.status === 'failed')
+    for (const chunk of failedChunks) {
+      await uploadChunk(chunk)
+    }
+  }, [chunks, uploadChunk])
+
+  const fetchMissingTranscripts = useCallback(async () => {
+    const ackedChunks = chunks.filter(c => c.status === 'acked' && !c.transcript)
+    for (const chunk of ackedChunks) {
+      pollTranscription(chunk.chunkId)
+    }
+  }, [chunks, pollTranscription])
+
   const clearChunks = useCallback(() => {
     for (const c of chunks) URL.revokeObjectURL(c.url)
     setChunks([])
   }, [chunks])
 
-  // cleanup on unmount
-  useEffect(() => {
-    return () => {
-      processorRef.current?.disconnect()
-      streamRef.current?.getTracks().forEach((t) => t.stop())
-      if (audioCtxRef.current?.state !== "closed") {
-        audioCtxRef.current?.close()
+  const recoverFromOPFS = useCallback(async () => {
+    const storedChunkIds = await opfsManager.listChunks()
+    for (const chunkId of storedChunkIds) {
+      const data = await opfsManager.getChunk(chunkId)
+      if (data) {
+        const blob = new Blob([data], { type: 'audio/wav' })
+        const url = URL.createObjectURL(blob)
+        const chunk: WavChunk = {
+          id: crypto.randomUUID(),
+          chunkId,
+          blob,
+          url,
+          duration: 0, // unknown
+          timestamp: Date.now(),
+          status: 'stored',
+        }
+        setChunks((prev) => [...prev, chunk])
+        await uploadChunk(chunk)
       }
-      if (timerRef.current) clearInterval(timerRef.current)
     }
+  }, [uploadChunk])
+
+  // Initialize OPFS on mount
+  useEffect(() => {
+    opfsManager.init().catch(console.error)
   }, [])
 
-  return { status, start, stop, pause, resume, chunks, elapsed, stream, clearChunks }
+  return { 
+    status, 
+    start, 
+    stop, 
+    pause, 
+    resume, 
+    chunks, 
+    elapsed, 
+    stream, 
+    clearChunks,
+    retryFailedUploads,
+    recoverFromOPFS,
+    fetchMissingTranscripts
+  }
 }
