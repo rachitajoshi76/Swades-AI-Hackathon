@@ -9,6 +9,7 @@ export interface WavChunk {
   id: string
   chunkId: string
   blob: Blob
+  data?: ArrayBuffer // Store the raw data to avoid double arrayBuffer() calls
   url: string
   duration: number
   timestamp: number
@@ -96,29 +97,111 @@ export function useRecorder(options: UseRecorderOptions = {}) {
     setChunks((prev) => prev.map(c => c.id === chunk.id ? { ...c, status: 'uploading' } : c))
 
     try {
-      console.log('Uploading chunk:', chunk.chunkId)
-      console.log('Server URL:', env.NEXT_PUBLIC_SERVER_URL)
+      console.log('Uploading chunk:', chunk.chunkId, 'Size:', chunk.blob.size, 'bytes')
+      console.log('Server URL from process.env:', process.env.NEXT_PUBLIC_SERVER_URL)
+      
+      const serverUrl = '' // Use relative URLs since we're proxying through Next.js
+      console.log('Using server URL:', serverUrl || 'relative (proxied)')
 
-      const data = await chunk.blob.arrayBuffer()
+      // Use stored data if available, otherwise get from OPFS or blob
+      let data: ArrayBuffer
+      if (chunk.data) {
+        data = chunk.data
+        console.log('Using stored chunk data, size:', data.byteLength)
+      } else {
+        try {
+          const opfsData = await opfsManager.getChunk(chunk.chunkId)
+          if (opfsData) {
+            data = opfsData
+            console.log('Using data from OPFS, size:', opfsData.byteLength)
+          } else {
+            console.log('No stored data, trying blob...')
+            data = await chunk.blob.arrayBuffer()
+            console.log('Using data from blob, size:', data.byteLength)
+          }
+        } catch (error) {
+          console.log('OPFS/blob retrieval failed, trying blob directly:', error)
+          try {
+            data = await chunk.blob.arrayBuffer()
+            console.log('Blob data retrieved, size:', data.byteLength)
+          } catch (blobError) {
+            console.error('Blob arrayBuffer failed:', blobError)
+            throw new Error('Cannot retrieve chunk data')
+          }
+        }
+      }
+
       const bytes = new Uint8Array(data)
+      console.log('Data size:', bytes.length, 'bytes')
       
       // Convert to base64 without spreading (prevents stack overflow)
       let binaryString = ''
       const chunkSize = 8192
-      for (let i = 0; i < bytes.length; i += chunkSize) {
-        binaryString += String.fromCharCode.apply(null, Array.from(bytes.slice(i, i + chunkSize)))
+      try {
+        for (let i = 0; i < bytes.length; i += chunkSize) {
+          binaryString += String.fromCharCode.apply(null, Array.from(bytes.slice(i, i + chunkSize)))
+        }
+        console.log('Binary string created, length:', binaryString.length)
+      } catch (encodeError) {
+        console.error('Base64 encoding failed:', encodeError)
+        throw new Error('Base64 encoding failed')
       }
+      
       const base64 = btoa(binaryString)
+      console.log('Base64 data length:', base64.length, 'characters')
 
-      const url = `${env.NEXT_PUBLIC_SERVER_URL}/api/chunks/upload`
+      const url = `${serverUrl}/api/chunks/upload`
       console.log('Fetch URL:', url)
 
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chunkId: chunk.chunkId, data: base64 }),
-      })
+      // Add timeout to fetch
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => {
+        console.log('Upload timeout triggered for chunk:', chunk.chunkId)
+        controller.abort()
+      }, 30000) // 30 second timeout
 
+      console.log('Starting fetch request...')
+      const requestBody = JSON.stringify({ chunkId: chunk.chunkId, data: base64 })
+      console.log('Request body size:', requestBody.length, 'characters')
+      
+      // Check if request body is too large (browser limit is usually ~2MB)
+      if (requestBody.length > 1024 * 1024) { // 1MB limit
+        console.warn('Request body too large:', requestBody.length, 'characters')
+        throw new Error('Request payload too large')
+      }
+      
+      // Test basic connectivity first
+      try {
+        console.log('Testing basic connectivity to server...')
+        const testResponse = await fetch(`${serverUrl}/`, { method: 'GET' })
+        console.log('Basic connectivity test:', testResponse.status)
+      } catch (testError) {
+        console.error('Basic connectivity failed:', testError)
+      }
+      
+      let response: Response
+      try {
+        response = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: requestBody,
+          signal: controller.signal,
+        })
+      } catch (fetchError) {
+        if (fetchError instanceof Error && fetchError.name === 'AbortError') {
+          console.error('Fetch aborted due to timeout for chunk:', chunk.chunkId)
+          throw new Error('Upload timed out')
+        }
+        console.error('Fetch failed with error:', fetchError)
+        if (fetchError instanceof Error) {
+          console.error('Error name:', fetchError.name)
+          console.error('Error message:', fetchError.message)
+        }
+        throw fetchError
+      }
+
+      clearTimeout(timeoutId)
+      console.log('Fetch completed, response received')
       console.log('Response status:', response.status)
 
       if (response.ok) {
@@ -128,24 +211,28 @@ export function useRecorder(options: UseRecorderOptions = {}) {
         // Clear from OPFS after successful ack
         await opfsManager.deleteChunk(chunk.chunkId)
         // Start polling for transcription
-        pollTranscription(chunk.chunkId)
+        pollTranscription(chunk.chunkId, serverUrl)
       } else {
         const errorText = await response.text()
         throw new Error(`Upload failed with status ${response.status}: ${errorText}`)
       }
     } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        console.error('Upload timed out for chunk:', chunk.chunkId)
+        throw new Error('Upload timed out')
+      }
       console.error('Upload failed:', error, error instanceof Error ? error.stack : '')
       setChunks((prev) => prev.map(c => c.id === chunk.id ? { ...c, status: 'failed' } : c))
     }
   }, [])
 
-  const pollTranscription = useCallback((chunkId: string) => {
+  const pollTranscription = useCallback((chunkId: string, serverUrl: string) => {
     const maxAttempts = 120 // 2 minutes with 1s intervals
     let attempts = 0
 
     const poll = async () => {
       try {
-        const response = await fetch(`${env.NEXT_PUBLIC_SERVER_URL}/api/chunks/${chunkId}`)
+        const response = await fetch(`${serverUrl || ''}/api/chunks/${chunkId}`)
         if (!response.ok) {
           console.warn(`Failed to fetch chunk ${chunkId}:`, response.status)
           return
@@ -182,6 +269,16 @@ export function useRecorder(options: UseRecorderOptions = {}) {
     if (samplesRef.current.length === 0) return
 
     const totalLen = samplesRef.current.reduce((n, b) => n + b.length, 0)
+    
+    // Skip chunks that have less than 0.1 seconds of audio to avoid empty/near-empty chunks
+    const minSamples = Math.floor(SAMPLE_RATE * 0.1)
+    if (totalLen < minSamples) {
+      console.log(`Skipping chunk with ${totalLen} samples (duration: ${(totalLen / SAMPLE_RATE).toFixed(2)}s) - below minimum threshold`)
+      samplesRef.current = []
+      sampleCountRef.current = 0
+      return
+    }
+
     const merged = new Float32Array(totalLen)
     let offset = 0
     for (const buf of samplesRef.current) {
@@ -194,10 +291,12 @@ export function useRecorder(options: UseRecorderOptions = {}) {
     const blob = encodeWav(merged, SAMPLE_RATE)
     const url = URL.createObjectURL(blob)
     const chunkId = crypto.randomUUID()
+    const data = await blob.arrayBuffer() // Get data once
     const chunk: WavChunk = {
       id: crypto.randomUUID(),
       chunkId,
       blob,
+      data, // Store the raw data
       url,
       duration: merged.length / SAMPLE_RATE,
       timestamp: Date.now(),
@@ -206,9 +305,11 @@ export function useRecorder(options: UseRecorderOptions = {}) {
       transcript: undefined,
     }
 
+    console.log(`Creating chunk with ${totalLen} samples (duration: ${chunk.duration.toFixed(2)}s)`)
+
     // Store in OPFS
     try {
-      await opfsManager.storeChunk(chunkId, await blob.arrayBuffer())
+      await opfsManager.storeChunk(chunkId, data)
     } catch (error) {
       console.error('Failed to store chunk in OPFS:', error)
       chunk.status = 'failed'
@@ -260,18 +361,27 @@ export function useRecorder(options: UseRecorderOptions = {}) {
           const blob = encodeWav(merged, SAMPLE_RATE)
           const url = URL.createObjectURL(blob)
           const chunkId = crypto.randomUUID()
-          const chunk: WavChunk = {
-            id: crypto.randomUUID(),
-            chunkId,
-            blob,
-            url,
-            duration: merged.length / SAMPLE_RATE,
-            timestamp: Date.now(),
-            status: 'stored',
-            transcriptionStatus: 'pending',
-            transcript: undefined,
+          const duration = merged.length / SAMPLE_RATE
+          
+          // Only create chunk if it has meaningful audio (at least 0.1 seconds)
+          if (duration >= 0.1) {
+            const chunk: WavChunk = {
+              id: crypto.randomUUID(),
+              chunkId,
+              blob,
+              url,
+              duration,
+              timestamp: Date.now(),
+              status: 'stored',
+              transcriptionStatus: 'pending',
+              transcript: undefined,
+            }
+            console.log(`Creating periodic chunk with duration: ${duration.toFixed(2)}s`)
+            setChunks((prev) => [...prev, chunk])
+          } else {
+            console.log(`Skipping periodic chunk with duration: ${duration.toFixed(2)}s - below minimum threshold`)
+            URL.revokeObjectURL(url)
           }
-          setChunks((prev) => [...prev, chunk])
         }
       }
 
@@ -339,9 +449,10 @@ export function useRecorder(options: UseRecorderOptions = {}) {
   }, [chunks, uploadChunk])
 
   const fetchMissingTranscripts = useCallback(async () => {
+    const serverUrl = '' // Use relative URLs since we're proxying through Next.js
     const ackedChunks = chunks.filter(c => c.status === 'acked' && !c.transcript)
     for (const chunk of ackedChunks) {
-      pollTranscription(chunk.chunkId)
+      pollTranscription(chunk.chunkId, serverUrl)
     }
   }, [chunks, pollTranscription])
 

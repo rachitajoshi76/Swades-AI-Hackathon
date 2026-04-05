@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useRef, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import { Download, Mic, Pause, Play, Square, Trash2 } from "lucide-react"
 
 import { Button } from "@my-better-t-app/ui/components/button"
@@ -29,6 +29,13 @@ function ChunkRow({ chunk, index }: { chunk: WavChunk; index: number }) {
   const audioRef = useRef<HTMLAudioElement>(null)
   const [playing, setPlaying] = useState(false)
   const [showTranscript, setShowTranscript] = useState(chunk.transcriptionStatus === 'completed')
+
+  // Auto-show transcript when it's completed
+  useEffect(() => {
+    if (chunk.transcriptionStatus === 'completed' && chunk.transcript) {
+      setShowTranscript(true)
+    }
+  }, [chunk.transcriptionStatus, chunk.transcript])
 
   const toggle = () => {
     const el = audioRef.current
